@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
-declare_id!("3QW7QtQP4bc8wtoxvH3gZtQUS97gMor8cbQjn4StoUoL"); // replace after deploy v0.2
+declare_id!("3QW7QtQP4bc8wtoxvH3gZtQUS97gMor8cbQjn4StoUoL"); // replace after deploy v0.3
 
 // ── CONSTANTS (immutable) ─────────────────────────────────────────────────────
 const TREASURY: &str = "A1TRS3i2g62Zf6K4vybsW4JLx8wifqSoThyTQqXNaLDK";
@@ -31,6 +31,9 @@ const AVS_COLLATERAL_EPOCHS: u64 = 30;
 
 // Slash dispute window: 3 epochs to contest
 const SLASH_DISPUTE_EPOCHS: u64 = 3;
+
+// THEO FIX 5: Contest bond — prevents spam contesting
+const CONTEST_BOND: u64 = 10_000_000_000;  // 10 XNT locked to contest
 
 const MAX_AVS: usize = 50;
 const MAX_OPERATORS: usize = 200;
@@ -372,6 +375,67 @@ pub mod restaking {
         Err(RestakingError::OperatorNotFound.into())
     }
 
+
+    /// THEO FIX 1: Resolve contested slash — x1scroll authority decides outcome
+    /// upheld=true: slash executes + contest bond burned
+    /// upheld=false: slash cancelled + contest bond returned to validator
+    pub fn resolve_contested_slash(
+        ctx: Context<ResolveContestedSlash>,
+        operator_identity: Pubkey,
+        avs_index: u32,
+        uphold_slash: bool,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+        require!(ctx.accounts.authority.key() == state.authority, RestakingError::Unauthorized);
+
+        for i in 0..state.operator_count as usize {
+            if state.operators[i].identity == operator_identity && state.operators[i].avs_index == avs_index {
+                require!(state.operators[i].slash_contested, RestakingError::NotContested);
+
+                if uphold_slash {
+                    let slash_amount = state.operators[i].restaked_amount * SLASH_BPS / BASIS_POINTS;
+                    let treasury_cut = slash_amount * TREASURY_BPS / BASIS_POINTS;
+                    let burn_cut = slash_amount - treasury_cut;
+                    system_program::transfer(CpiContext::new(ctx.accounts.system_program.to_account_info(),
+                        system_program::Transfer { from: ctx.accounts.restake_vault.to_account_info(), to: ctx.accounts.treasury.to_account_info() }), treasury_cut)?;
+                    system_program::transfer(CpiContext::new(ctx.accounts.system_program.to_account_info(),
+                        system_program::Transfer { from: ctx.accounts.restake_vault.to_account_info(), to: ctx.accounts.burn_address.to_account_info() }), burn_cut + CONTEST_BOND)?;
+                    state.operators[i].restaked_amount = state.operators[i].restaked_amount.checked_sub(slash_amount).ok_or(RestakingError::MathOverflow)?;
+                    state.operators[i].slashed = true;
+                    state.total_burned = state.total_burned.checked_add(burn_cut + CONTEST_BOND).ok_or(RestakingError::MathOverflow)?;
+                } else {
+                    // Dismissed — return contest bond to validator
+                    system_program::transfer(CpiContext::new(ctx.accounts.system_program.to_account_info(),
+                        system_program::Transfer { from: ctx.accounts.restake_vault.to_account_info(), to: ctx.accounts.validator_wallet.to_account_info() }), CONTEST_BOND)?;
+                }
+                state.operators[i].slash_contested = false;
+                state.operators[i].slash_epoch = 0;
+                emit!(SlashResolved { identity: operator_identity, avs_index, upheld: uphold_slash, epoch: Clock::get()?.epoch });
+                return Ok(());
+            }
+        }
+        Err(RestakingError::OperatorNotFound.into())
+    }
+
+    /// THEO FIX 3: Release AVS collateral after 30-epoch lockup
+    pub fn release_avs_collateral(
+        ctx: Context<ReleaseAvsCollateral>,
+        avs_index: u32,
+    ) -> Result<()> {
+        let state = &mut ctx.accounts.state;
+        let avs_idx = avs_index as usize;
+        require!(avs_idx < state.avs_count as usize, RestakingError::AvsNotFound);
+        require!(state.avs_registry[avs_idx].authority == ctx.accounts.avs_authority.key(), RestakingError::Unauthorized);
+        require!(Clock::get()?.epoch >= state.avs_registry[avs_idx].collateral_release_epoch, RestakingError::CollateralStillLocked);
+        let collateral = state.avs_registry[avs_idx].collateral_amount;
+        require!(collateral > 0, RestakingError::NothingToClaim);
+        system_program::transfer(CpiContext::new(ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer { from: ctx.accounts.restake_vault.to_account_info(), to: ctx.accounts.avs_authority.to_account_info() }), collateral)?;
+        state.avs_registry[avs_idx].collateral_amount = 0;
+        emit!(CollateralReleased { avs_index, amount: collateral, epoch: Clock::get()?.epoch });
+        Ok(())
+    }
+
     /// Begin unbond (14 epoch cooldown)
     pub fn begin_unbond(ctx: Context<BeginUnbond>, avs_index: u32) -> Result<()> {
         let state = &mut ctx.accounts.state;
@@ -380,6 +444,7 @@ pub mod restaking {
             if state.operators[i].identity == identity && state.operators[i].avs_index == avs_index {
                 require!(!state.operators[i].unbonding, RestakingError::AlreadyUnbonding);
                 require!(state.operators[i].slash_epoch == 0, RestakingError::SlashPending);
+                require!(!state.operators[i].slash_contested, RestakingError::SlashContested);
                 state.operators[i].unbonding = true;
                 state.operators[i].unbond_epoch = Clock::get()?.epoch + UNBOND_EPOCHS;
                 emit!(UnbondStarted { identity, avs_index, release_epoch: state.operators[i].unbond_epoch });
@@ -411,8 +476,11 @@ pub mod restaking {
                     system_program::Transfer { from: ctx.accounts.restake_vault.to_account_info(), to: ctx.accounts.validator_identity.to_account_info() }), withdraw_amount)?;
 
                 // Update state — decrement operator count slot reuse
+                // THEO FIX 2: Clear rewards on withdraw prevents re-opt farming
                 state.operators[i].restaked_amount = 0;
-                state.operators[i].avs_index = u32::MAX; // mark as freed
+                state.operators[i].rewards_earned = 0;
+                state.operators[i].rewards_claimed = 0;
+                state.operators[i].avs_index = u32::MAX;
                 let avs_idx = avs_index as usize;
                 state.avs_registry[avs_idx].total_secured = state.avs_registry[avs_idx].total_secured
                     .checked_sub(withdraw_amount).ok_or(RestakingError::MathOverflow)?;
@@ -545,6 +613,38 @@ pub struct ContestSlash<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ResolveContestedSlash<'info> {
+    #[account(mut, seeds = [b"restaking-v2"], bump = state.bump)]
+    pub state: Account<'info, RestakingState>,
+    pub authority: Signer<'info>,
+    /// CHECK: validator wallet — contest bond returned if dismissed
+    #[account(mut)]
+    pub validator_wallet: AccountInfo<'info>,
+    /// CHECK: vault
+    #[account(mut, seeds = [b"restake-vault-v2"], bump)]
+    pub restake_vault: AccountInfo<'info>,
+    /// CHECK: treasury
+    #[account(mut, constraint = treasury.key().to_string() == TREASURY @ RestakingError::InvalidTreasury)]
+    pub treasury: AccountInfo<'info>,
+    /// CHECK: burn
+    #[account(mut, constraint = burn_address.key().to_string() == BURN_ADDRESS @ RestakingError::InvalidBurnAddress)]
+    pub burn_address: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ReleaseAvsCollateral<'info> {
+    #[account(mut, seeds = [b"restaking-v2"], bump = state.bump)]
+    pub state: Account<'info, RestakingState>,
+    #[account(mut)]
+    pub avs_authority: Signer<'info>,
+    /// CHECK: vault
+    #[account(mut, seeds = [b"restake-vault-v2"], bump)]
+    pub restake_vault: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct BeginUnbond<'info> {
     #[account(mut, seeds = [b"restaking-v2"], bump = state.bump)]
     pub state: Account<'info, RestakingState>,
@@ -635,6 +735,10 @@ pub struct OperatorSlashed { pub identity: Pubkey, pub avs_index: u32, pub slash
 #[event]
 pub struct UnbondStarted { pub identity: Pubkey, pub avs_index: u32, pub release_epoch: u64 }
 #[event]
+pub struct SlashResolved { pub identity: Pubkey, pub avs_index: u32, pub upheld: bool, pub epoch: u64 }
+#[event]
+pub struct CollateralReleased { pub avs_index: u32, pub amount: u64, pub epoch: u64 }
+#[event]
 pub struct StakeWithdrawn { pub identity: Pubkey, pub avs_index: u32, pub amount: u64, pub epoch: u64 }
 
 // ── ERRORS ────────────────────────────────────────────────────────────────────
@@ -691,6 +795,10 @@ pub enum RestakingError {
     Unauthorized,
     #[msg("Math overflow or underflow")]
     MathOverflow,
+    #[msg("Slash has not been contested")]
+    NotContested,
+    #[msg("AVS collateral still locked — wait for release epoch")]
+    CollateralStillLocked,
     #[msg("Invalid treasury address")]
     InvalidTreasury,
     #[msg("Invalid burn address")]
